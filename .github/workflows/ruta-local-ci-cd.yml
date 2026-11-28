@@ -1,0 +1,133 @@
+name: Ruta Local - Calidad y publicacion
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Cada lunes 12:23 UTC = 07:23 en Colombia (UTC-5).
+    - cron: '23 12 * * 1'
+  workflow_dispatch:
+
+# El workflow solo puede leer el repositorio, salvo el job de publicacion.
+permissions:
+  contents: read
+
+concurrency:
+  group: ruta-local-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  calidad:
+    name: Calidad y recuperacion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Crear sitio publicado desde trabajo (sin hacer commits)
+        run: python scripts/herramientas.py sincronizar
+
+      - name: Revisar HTML, accesibilidad basica, enlaces e imagenes
+        run: python scripts/validar_sitio.py
+
+      - name: Probar sincronizacion, copias, recuperacion e integridad SHA-256
+        shell: bash
+        run: |
+          mkdir -p reportes
+          set -o pipefail
+          python -m unittest discover -s tests -p 'test_*.py' -v 2>&1 | tee reportes/pruebas.txt
+
+      - name: Crear respaldo de la version que se va a publicar
+        if: github.event_name != 'pull_request'
+        run: python scripts/herramientas.py respaldar
+
+      - name: Guardar reporte de pruebas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-pruebas-${{ github.run_id }}
+          path: reportes/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Guardar respaldo automatico (NO sustituye una copia externa)
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: respaldo-sitio-${{ github.run_id }}
+          path: respaldos/
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: false
+
+      - name: Preparar artefacto de Pages solo si pasaron las pruebas
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/
+
+      - name: Resumen de validacion
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '### Ruta Local - validacion'
+            echo '- Sitio generado automaticamente desde `trabajo/`'
+            echo '- Archivos locales, HTML y recursos comprobados'
+            echo '- Pruebas de respaldo/restauracion ejecutadas en carpetas temporales'
+            echo '- No se altero el sitio publico durante las pruebas'
+            echo '- Revisar los artefactos para descargar las evidencias'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publicar:
+    name: Publicacion controlada
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: calidad
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publicar sitio aprobado en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Descargar codigo del verificador
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verificar que el sitio esta accesible tras publicar
+        env:
+          SITE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: python scripts/verificar_publicacion.py --url "$SITE_URL" --intentos 6 --espera 10
+
+  vigilancia:
+    name: Comprobacion semanal de la web
+    if: github.event_name == 'schedule'
+    needs: calidad
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Revisar sitio publico y sus recursos
+        run: python scripts/verificar_publicacion.py --url 'https://los-ultimos-estudia.github.io/proyecto_estudia/' --intentos 3 --espera 10
